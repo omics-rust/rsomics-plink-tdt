@@ -1,0 +1,4 @@
+ CHR  SNP           BP  A1  A2      T      U           OR        CHISQ            P 
+   1  rs1         1000   A   G      3      0           NA            3      0.08326  
+   1  rs2         2000   A   G      0      2            0            2       0.1573  
+   1  rs3         3000   A   G      2      2            1            0            1  
