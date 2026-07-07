@@ -8,8 +8,130 @@
 //! A1 is the minor allele by founder allele frequency (PLINK's convention),
 //! which fixes the T/U orientation and the A1/A2 labels.
 
-use rsomics_pgen::Pgen;
-use std::io::{self, Write};
+use rsomics_pgen::{Pgen, Sample, Variant};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::Path;
+
+/// Load a PLINK1 `.bed/.bim/.fam` fileset, tolerating PLINK's `-9`
+/// (unknown-sex) code in the `.fam` sex column. `rsomics_pgen::Pgen::load`
+/// parses that column as `u8` and rejects `-9`, but `--tdt` never reads sex,
+/// so we parse the fileset here and keep PLINK's acceptance of the code.
+pub fn load_fileset(prefix: &Path) -> anyhow::Result<Pgen> {
+    let variants = parse_bim(&prefix.with_extension("bim"))?;
+    let samples = parse_fam(&prefix.with_extension("fam"))?;
+    let gt_raw = read_bed(&prefix.with_extension("bed"), variants.len(), samples.len())?;
+    Ok(Pgen {
+        variants,
+        samples,
+        gt_raw,
+    })
+}
+
+fn parse_bim(path: &Path) -> anyhow::Result<Vec<Variant>> {
+    let mut out = Vec::new();
+    for (lineno, line) in BufReader::new(File::open(path)?).lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = trimmed.split_whitespace().collect();
+        anyhow::ensure!(
+            fields.len() >= 6,
+            "malformed {} line {}: {} fields, expected 6",
+            path.display(),
+            lineno + 1,
+            fields.len()
+        );
+        let cm: f64 = fields[2].parse().map_err(|_| {
+            anyhow::anyhow!(
+                "malformed {} line {}: bad cM {:?}",
+                path.display(),
+                lineno + 1,
+                fields[2]
+            )
+        })?;
+        let pos: u64 = fields[3].parse().map_err(|_| {
+            anyhow::anyhow!(
+                "malformed {} line {}: bad pos {:?}",
+                path.display(),
+                lineno + 1,
+                fields[3]
+            )
+        })?;
+        out.push(Variant {
+            chrom: fields[0].to_string(),
+            id: fields[1].to_string(),
+            cm,
+            pos,
+            a1: fields[4].to_string(),
+            a2: fields[5].to_string(),
+        });
+    }
+    Ok(out)
+}
+
+fn parse_fam(path: &Path) -> anyhow::Result<Vec<Sample>> {
+    let mut out = Vec::new();
+    for (lineno, line) in BufReader::new(File::open(path)?).lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = trimmed.split_whitespace().collect();
+        anyhow::ensure!(
+            fields.len() >= 6,
+            "malformed {} line {}: {} fields, expected 6",
+            path.display(),
+            lineno + 1,
+            fields.len()
+        );
+        // PLINK writes 0 for unknown sex but accepts any code, including -9;
+        // it is unused by --tdt, so a non-`u8` code maps to unknown (0).
+        let sex = fields[4].parse::<u8>().unwrap_or(0);
+        out.push(Sample {
+            fid: fields[0].to_string(),
+            iid: fields[1].to_string(),
+            pid: fields[2].to_string(),
+            mid: fields[3].to_string(),
+            sex,
+            phen: fields[5].to_string(),
+        });
+    }
+    Ok(out)
+}
+
+fn read_bed(path: &Path, n_variants: usize, n_samples: usize) -> anyhow::Result<Vec<u8>> {
+    let mut f = File::open(path)?;
+    let mut header = [0u8; 3];
+    f.read_exact(&mut header)?;
+    anyhow::ensure!(
+        header[0] == 0x6c && header[1] == 0x1b,
+        "{}: bad .bed magic [{:#x}, {:#x}, {:#x}]",
+        path.display(),
+        header[0],
+        header[1],
+        header[2]
+    );
+    anyhow::ensure!(
+        header[2] == 0x01,
+        "{}: sample-major .bed — rerun PLINK with --make-bed",
+        path.display()
+    );
+    let bpv = n_samples.div_ceil(4);
+    let expected = (bpv * n_variants) as u64;
+    let have = f.metadata()?.len() - 3;
+    anyhow::ensure!(
+        have == expected,
+        "{}: .bed size mismatch, have {have} bytes, expected {expected} for {n_variants}×{n_samples}",
+        path.display()
+    );
+    let mut out = vec![0u8; bpv * n_variants];
+    f.read_exact(&mut out)?;
+    Ok(out)
+}
 
 pub struct TdtRecord {
     pub chrom: String,
@@ -224,6 +346,72 @@ pub fn tdt(pgen: &Pgen) -> Vec<TdtRecord> {
             }
         })
         .collect()
+}
+
+/// PLINK 1.9 writes no `.tdt` at all when nothing is testable, emitting one of
+/// these skip warnings instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipReason {
+    NoTrios,
+    NoAffectedTrio,
+    NoTestableVariant,
+}
+
+impl SkipReason {
+    /// The exact `Warning: Skipping --tdt …` line PLINK prints to stderr, with
+    /// PLINK's mid-sentence wrap on the affected-child case reproduced.
+    #[must_use]
+    pub fn warning(self) -> &'static str {
+        match self {
+            SkipReason::NoTrios => "Warning: Skipping --tdt since there are no trios.",
+            SkipReason::NoAffectedTrio => {
+                "Warning: Skipping --tdt since there are no trios with an affected child, and no\ndiscordant parent pairs."
+            }
+            SkipReason::NoTestableVariant => {
+                "Warning: Skipping --tdt since there is no autosomal or Xchr data."
+            }
+        }
+    }
+}
+
+pub enum TdtOutput {
+    Report(Vec<TdtRecord>),
+    Skip(SkipReason),
+}
+
+/// Decide whether PLINK would emit a report or skip, matching its precedence:
+/// trio structure is checked before variant coverage, and the absence of any
+/// affected complete trio is distinguished from the absence of any trio at all.
+#[must_use]
+pub fn tdt_report(pgen: &Pgen) -> TdtOutput {
+    if trios(pgen).is_empty() {
+        return TdtOutput::Skip(if has_structural_trio(pgen) {
+            SkipReason::NoAffectedTrio
+        } else {
+            SkipReason::NoTrios
+        });
+    }
+    if !pgen.variants.iter().any(|v| tdt_tested(&v.chrom)) {
+        return TdtOutput::Skip(SkipReason::NoTestableVariant);
+    }
+    TdtOutput::Report(tdt(pgen))
+}
+
+/// Whether any offspring names two parents both present in its family,
+/// regardless of affection — PLINK's notion of a trio for the skip message.
+fn has_structural_trio(pgen: &Pgen) -> bool {
+    use std::collections::HashSet;
+    let keys: HashSet<(&str, &str)> = pgen
+        .samples
+        .iter()
+        .map(|s| (s.fid.as_str(), s.iid.as_str()))
+        .collect();
+    pgen.samples.iter().any(|s| {
+        s.pid != "0"
+            && s.mid != "0"
+            && keys.contains(&(s.fid.as_str(), s.pid.as_str()))
+            && keys.contains(&(s.fid.as_str(), s.mid.as_str()))
+    })
 }
 
 /// PLINK maps the sex chromosomes and MT onto numeric codes in its reports.
@@ -536,6 +724,105 @@ mod tests {
         assert_eq!(transmit(0, 0, 2), (0, 0)); // Mendel-inconsistent
         assert_eq!(transmit(1, 2, 2), (0, 0)); // missing parent
         assert_eq!(transmit(2, 3, 2), (1, 0));
+    }
+
+    fn sample(fid: &str, iid: &str, pid: &str, mid: &str, phen: &str) -> Sample {
+        Sample {
+            fid: fid.into(),
+            iid: iid.into(),
+            pid: pid.into(),
+            mid: mid.into(),
+            sex: 0,
+            phen: phen.into(),
+        }
+    }
+
+    fn variant(chrom: &str) -> Variant {
+        Variant {
+            chrom: chrom.into(),
+            id: "rs".into(),
+            cm: 0.0,
+            pos: 1,
+            a1: "A".into(),
+            a2: "G".into(),
+        }
+    }
+
+    fn pgen(samples: Vec<Sample>, variants: Vec<Variant>) -> Pgen {
+        let bpv = samples.len().div_ceil(4);
+        Pgen {
+            gt_raw: vec![0u8; bpv * variants.len()],
+            samples,
+            variants,
+        }
+    }
+
+    #[test]
+    fn skip_warnings_are_plink_exact() {
+        assert_eq!(
+            SkipReason::NoTrios.warning(),
+            "Warning: Skipping --tdt since there are no trios."
+        );
+        assert_eq!(
+            SkipReason::NoAffectedTrio.warning(),
+            "Warning: Skipping --tdt since there are no trios with an affected child, and no\n\
+             discordant parent pairs."
+        );
+        assert_eq!(
+            SkipReason::NoTestableVariant.warning(),
+            "Warning: Skipping --tdt since there is no autosomal or Xchr data."
+        );
+    }
+
+    #[test]
+    fn tdt_report_routes_skips_like_plink() {
+        let founders = pgen(
+            vec![
+                sample("F", "A", "0", "0", "2"),
+                sample("F", "B", "0", "0", "1"),
+            ],
+            vec![variant("1")],
+        );
+        assert!(matches!(
+            tdt_report(&founders),
+            TdtOutput::Skip(SkipReason::NoTrios)
+        ));
+
+        let unaffected = pgen(
+            vec![
+                sample("F", "D", "0", "0", "1"),
+                sample("F", "M", "0", "0", "1"),
+                sample("F", "K", "D", "M", "1"),
+            ],
+            vec![variant("1")],
+        );
+        assert!(matches!(
+            tdt_report(&unaffected),
+            TdtOutput::Skip(SkipReason::NoAffectedTrio)
+        ));
+
+        let y_only = pgen(
+            vec![
+                sample("F", "D", "0", "0", "1"),
+                sample("F", "M", "0", "0", "1"),
+                sample("F", "K", "D", "M", "2"),
+            ],
+            vec![variant("24")],
+        );
+        assert!(matches!(
+            tdt_report(&y_only),
+            TdtOutput::Skip(SkipReason::NoTestableVariant)
+        ));
+
+        let testable = pgen(
+            vec![
+                sample("F", "D", "0", "0", "1"),
+                sample("F", "M", "0", "0", "1"),
+                sample("F", "K", "D", "M", "2"),
+            ],
+            vec![variant("1")],
+        );
+        assert!(matches!(tdt_report(&testable), TdtOutput::Report(_)));
     }
 
     #[test]

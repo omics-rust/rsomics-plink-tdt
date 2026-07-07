@@ -1,6 +1,5 @@
 use clap::Parser;
-use rsomics_pgen::Pgen;
-use rsomics_plink_tdt::{tdt, write_tdt};
+use rsomics_plink_tdt::{TdtOutput, load_fileset, tdt_report, write_tdt};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
@@ -45,8 +44,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         .build_global()
         .ok();
 
-    let pgen = Pgen::load(&cli.bfile)?;
-    let records = tdt(&pgen);
+    let pgen = load_fileset(&cli.bfile)?;
+    let records = match tdt_report(&pgen) {
+        TdtOutput::Report(records) => records,
+        // PLINK writes no report and exits 0 when nothing is testable.
+        TdtOutput::Skip(reason) => {
+            eprintln!("{}", reason.warning());
+            return Ok(());
+        }
+    };
 
     match cli.out {
         Some(prefix) => {
